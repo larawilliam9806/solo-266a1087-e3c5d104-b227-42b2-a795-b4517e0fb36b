@@ -220,3 +220,33 @@ def test_empty_and_invalid_rows_rejected(db):
     for rows in ([], [row(1, "S01", "R001", 0, 0)]):
         with pytest.raises(SubmissionError):
             submit(db, "OX", rows)
+
+
+def test_schema_upgrade_is_idempotent_and_preserves_orders(db):
+    """Old databases keep working: re-init adds indexes, keeps rows/tails."""
+    from archive.db import SCHEMA_VERSION, connect, init_db
+
+    submit(db, "O1", [row(1, "S01", "R001", 0, 10)])
+    before = reel_state(db, "R001")
+    conn = connect(db)
+    conn.execute("PRAGMA user_version = 0")  # pretend it is an older DB
+    conn.close()
+
+    init_db(db)
+    init_db(db)
+
+    conn = connect(db)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    indexes = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    conn.close()
+    assert "idx_archive_segments_reel_arch" in indexes
+    assert reel_state(db, "R001") == before
+    assert get_order(db, "O1") is not None
+    # Upgraded database still accepts new orders on the same reel.
+    report = submit(db, "O2", [row(1, "S01", "R001", 5, 10)])
+    assert report["copies"][-1]["is_new"] is True

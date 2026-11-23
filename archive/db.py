@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS archive_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_archive_segments_reel_orig
     ON archive_segments (reel_id, orig_start);
+CREATE INDEX IF NOT EXISTS idx_archive_segments_reel_arch
+    ON archive_segments (reel_id, arch_start);
 
 -- Parsed rows of the submitted edit list.
 CREATE TABLE IF NOT EXISTS shots (
@@ -82,36 +84,54 @@ CREATE TABLE IF NOT EXISTS shot_segments (
 CREATE INDEX IF NOT EXISTS idx_shot_segments_order
     ON shot_segments (order_id, row_index, seg_index);
 
--- Safety net: original frame intervals in one reel may never overlap.
-CREATE TRIGGER IF NOT EXISTS trg_archive_orig_no_overlap
+-- Interval checks use the index: with non-overlapping existing segments, a
+-- new half-open interval [s, e) overlaps iff its nearest predecessor reaches
+-- past s or its nearest successor starts before e.  Looking only at those two
+-- rows keeps bulk inserts linear instead of scanning the whole reel per row.
+DROP TRIGGER IF EXISTS trg_archive_orig_no_overlap;
+CREATE TRIGGER trg_archive_orig_no_overlap
 BEFORE INSERT ON archive_segments
 FOR EACH ROW
-WHEN EXISTS (
+WHEN (
+    SELECT orig_start + frame_count FROM archive_segments
+    WHERE reel_id = NEW.reel_id AND orig_start <= NEW.orig_start
+    ORDER BY orig_start DESC LIMIT 1
+) > NEW.orig_start
+OR (
     SELECT 1 FROM archive_segments
     WHERE reel_id = NEW.reel_id
-      AND NEW.orig_start < orig_start + frame_count
+      AND orig_start >= NEW.orig_start
       AND orig_start < NEW.orig_start + NEW.frame_count
-)
+    LIMIT 1
+) IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'archive segment overlaps an existing original range');
 END;
 
 -- Safety net: archive frame intervals in one reel may never overlap.
-CREATE TRIGGER IF NOT EXISTS trg_archive_arch_no_overlap
+DROP TRIGGER IF EXISTS trg_archive_arch_no_overlap;
+CREATE TRIGGER trg_archive_arch_no_overlap
 BEFORE INSERT ON archive_segments
 FOR EACH ROW
-WHEN EXISTS (
+WHEN (
+    SELECT arch_start + frame_count FROM archive_segments
+    WHERE reel_id = NEW.reel_id AND arch_start <= NEW.arch_start
+    ORDER BY arch_start DESC LIMIT 1
+) > NEW.arch_start
+OR (
     SELECT 1 FROM archive_segments
     WHERE reel_id = NEW.reel_id
-      AND NEW.arch_start < arch_start + frame_count
+      AND arch_start >= NEW.arch_start
       AND arch_start < NEW.arch_start + NEW.frame_count
-)
+    LIMIT 1
+) IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'archive segment overlaps an existing archive range');
 END;
 
 -- Safety net: frames can only be written below the current reel tail.
-CREATE TRIGGER IF NOT EXISTS trg_archive_within_tail
+DROP TRIGGER IF EXISTS trg_archive_within_tail;
+CREATE TRIGGER trg_archive_within_tail
 BEFORE INSERT ON archive_segments
 FOR EACH ROW
 WHEN NEW.arch_start + NEW.frame_count > (
@@ -123,31 +143,78 @@ END;
 """
 
 
+SCHEMA_VERSION = 2
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     """Open a connection configured for concurrent, explicit transactions."""
     conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL persists in the file, but synchronous is per-connection and would
+    # otherwise fall back to FULL on every request.  NORMAL is durable across
+    # application crashes in WAL mode and keeps commits short.
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
-def init_db(db_path: str | Path) -> None:
-    """Create the schema if needed.  Safe to call from every worker.
+def _user_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
 
-    Several gunicorn workers may boot at the same instant; the WAL switch and
-    DDL briefly need the write lock, so retry while another process holds it.
+
+def _split_statements(script: str) -> list[str]:
+    """Split a SQL script into complete statements, respecting trigger bodies.
+
+    ``executescript`` would implicitly commit an open transaction, so the
+    migration executes individual statements instead.  ``sqlite3
+    .complete_statement`` knows that ``BEGIN ... END;`` trigger bodies are a
+    single statement.
+    """
+    statements = []
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statements.append(buffer)
+            buffer = ""
+    if buffer.strip():
+        statements.append(buffer)
+    return statements
+
+
+def init_db(db_path: str | Path) -> None:
+    """Create or migrate the schema.  Safe to call from every worker.
+
+    The DDL runs only when the on-disk schema is older than
+    ``SCHEMA_VERSION``; a fresh or already-migrated database does no DDL, so
+    workers booting together do not repeatedly drop and recreate triggers.
+    The version check and DDL share one immediate transaction, so concurrent
+    boots are serialised and see the upgraded version afterwards.  Existing
+    data, order numbers and reel tails are left untouched.
     """
     path = Path(db_path)
     if str(path.parent) not in ("", "."):
         path.parent.mkdir(parents=True, exist_ok=True)
+    statements = _split_statements(SCHEMA)
     last_error: sqlite3.OperationalError | None = None
     for _ in range(50):
         conn = connect(path)
         try:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
-            conn.executescript(SCHEMA)
+            if _user_version(conn) >= SCHEMA_VERSION:
+                return
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if _user_version(conn) < SCHEMA_VERSION:
+                    for statement in statements:
+                        conn.execute(statement)
+                    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
             return
         except sqlite3.OperationalError as exc:  # pragma: no cover - timing
             last_error = exc

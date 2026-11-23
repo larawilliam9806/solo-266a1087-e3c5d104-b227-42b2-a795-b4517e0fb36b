@@ -11,7 +11,10 @@ CSV，系统为每个原卷建立一卷从 0 开始编号的档案卷，把新�
 | 填成片号、上传剪辑 CSV，每行镜头号/原卷号/起帧/帧数 | 交档页表单，CSV 全量校验后才落库 |
 | 每个原卷对应一个档案卷，档案帧号从 0 起 | `reels.next_frame` 初始为 0，`archive_segments` 从 0 起铺满 |
 | 已收帧沿用档案帧号，新帧连续追加到卷尾 | 覆盖索引命中的区间原地复用；未覆盖空隙只在卷尾分配 |
-| 同一帧一单多次引用 / 两单并发引用只拷一次 | 覆盖索引 + `BEGIN IMMEDIATE` 单事务；并发测试覆盖 |
+| 同一帧一单多次引用 / 两单并发引用只拷一次 | 覆盖索引 + 短写事务内二次核对；并发测试覆盖 |
+| 大单核算时不阻塞其他单入库（含同一档案卷追加） | 读取快照 + 内存规划不持锁；仅在短 `BEGIN IMMEDIATE` 内核对并写入 |
+| 规划后帧已被他单收档时沿用实际落点 | 提交时按落点增量核对，重新按真实覆盖规划 |
+| 同卷只追加本单用不到的帧时沿用已划分帧段，只顺延新拷段 | 覆盖未变则保留 `shot_segments`，仅把本单新拷段移到最新卷尾 |
 | 按单号查本次拷贝的原卷帧段与落点 | `/orders/<单号>` 与 `/api/orders/<单号>` 的 `copies` |
 | 查每个镜头依次从档案卷取哪些帧段以拼回原帧序 | 同页 `shots[].segments`，按 `seg_index` 顺序拼接 |
 | 清单与索引一同生效，失败时旧单和卷尾不变 | 单事务写入 `orders/shots/order_copies/shot_segments/archive_segments/reels`，异常整体回滚 |
@@ -23,6 +26,9 @@ CSV，系统为每个原卷建立一卷从 0 开始编号的档案卷，把新�
 * **档案卷尾**：`reels.next_frame`，该卷第一个尚未使用的档案帧号。
 * **覆盖索引**：`archive_segments` 记录“原卷帧段 → 档案帧段”的不重叠映射。
   命中即可复用；未命中才在卷尾分配并写入。
+* **快照规划**：提交先在只读快照上完成全部规划、清单与取帧单拼段，不持有写
+  锁；随后在一个短写事务里核对卷的增量变化并写入。大 CSV 因此不会让其他保管
+  员干等。
 
 取帧单里的每一段都是连续档案区间，按 `seg_index` 依次读取拼接即可还原该镜头
 的原始帧序，无需逐帧处理。
@@ -43,16 +49,23 @@ python3 -m archive          # 开发服务器，默认 0.0.0.0:8000
 * `SECRET_KEY`：会话密钥；未设置时会在数据库旁生成并持久化
   （`*.sqlite3.secret`），确保多 worker 共享同一密钥
 * `PORT` / `HOST`：开发服务器监听地址
+* `WEB_WORKERS` / `WEB_THREADS` / `WEB_TIMEOUT` / `BIND`：gunicorn 参数（见
+  `gunicorn.conf.py`）
 
 ## Docker Compose
 
 ```bash
-docker compose up --build
-# http://localhost:8000
+docker compose up --build          # 构建并启动，访问 http://localhost:8000
+docker compose ps                  # 查看健康状态
+docker compose down                # 停止（保留数据卷）
+docker compose down -v             # 停止并删除数据卷
 ```
 
-数据库文件位于命名卷 `archive-data`，重建容器不会丢失。生产部署请通过
-`SECRET_KEY` 环境变量显式提供密钥（`docker compose` 默认值仅供本机试用）。
+数据库文件位于命名卷 `archive-data`，重建容器不会丢失；旧库可直接挂载使用，
+启动时自动补齐索引与触发器，不改变已有单据。`PORT` 环境变量可改宿主机端口。
+生产部署请通过 `SECRET_KEY` 显式提供密钥（未设置时自动生成并持久化到数据卷，
+多 worker 共享）。容器以 4 worker × 4 线程运行 gunicorn，健康检查每 30 秒探测
+首页。
 
 ## 测试
 
@@ -62,7 +75,9 @@ python3 -m pytest -q
 
 覆盖：首单从 0 分配、复用+追加、单内重复引用去重、多原卷、取帧单顺序、校验
 失败回滚、事务中途异常回滚、重复单号、超大帧段（5000 万帧）不逐帧展开、随机
-不变量检查，以及多线程 / 多 gunicorn worker 并发交档。
+不变量检查，以及多线程 / 多 gunicorn worker 并发交档。`tests/test_incremental.py`
+用屏障精确复现“大单核算期间他单入库”的三类竞争：同帧被他单先收档、同卷仅追加
+无关帧、以及保存失败后已交单据与卷尾保持。
 
 ## CSV 格式
 
@@ -99,4 +114,7 @@ S02,R001,100,50
 * `shot_segments`：每个镜头按顺序应读取的档案帧段。
 * `reels`：每原卷一卷，`next_frame` 为卷尾。
 * `archive_segments`：全局覆盖索引，含触发器保证同卷内原卷帧段、档案帧段均
-  不重叠且不越过卷尾。
+  不重叠且不越过卷尾；区间检查走 `(reel_id, orig_start)` / `(reel_id,
+  arch_start)` 索引，大单批量写入为线性。
+* `PRAGMA user_version`：库结构版本。启动时仅在版本落后时于单个事务内补齐索引
+  与触发器，随后置为当前版本；多个 worker 同时启动也只迁移一次。

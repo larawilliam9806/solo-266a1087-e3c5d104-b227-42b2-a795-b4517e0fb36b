@@ -13,6 +13,13 @@ Invariants
 * ``archive_segments`` is a non-overlapping coverage index from original frame
   intervals to archive frame intervals.  Ranges already present are reused
   exactly where they are; only uncovered gaps are copied.
+* Planning runs against a lock-free read snapshot, without blocking other
+  submissions.  The plan is then reconciled with the current coverage index
+  and written inside one short ``BEGIN IMMEDIATE`` transaction, so a large
+  CSV never keeps other orders waiting.
+* If frames of a planned copy were archived by another order in the meantime,
+  the plan falls back to the actual archive location.  Frames still missing
+  are appended, in CSV row order, at the current reel tail.
 * An order, its copies and its per-shot retrieval plan become visible in one
   transaction.  Any failure rolls the whole submission back, leaving previous
   orders and reel tails untouched.
@@ -22,7 +29,8 @@ from __future__ import annotations
 
 import bisect
 import sqlite3
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +39,12 @@ from .db import connect
 MAX_IDENTIFIER_LEN = 200
 MAX_ROWS = 200_000
 MAX_FRAME = 2**62
+
+# A save is first prepared against a lock-free snapshot, then applied in a
+# short write transaction.  If another order commits in between, the
+# preparation is repeated; after this many optimistic attempts we fall back
+# to reconciling inside the write transaction so the order always progresses.
+APPLY_ATTEMPTS = 4
 
 
 class SubmissionError(Exception):
@@ -130,14 +144,24 @@ def validate_rows(rows) -> list[EditRow]:
     return cleaned
 
 
-def _load_reel(conn: sqlite3.Connection, orig_reel: str) -> _ReelState:
+def _load_reel(
+    conn: sqlite3.Connection, orig_reel: str, create: bool = False
+) -> _ReelState | None:
+    """Read one reel's tail and coverage index.
+
+    With ``create=True`` a missing reel is inserted with tail 0.  Planning
+    uses ``create=False`` so it never writes.
+    """
     row = conn.execute(
         "SELECT id, orig_reel, next_frame FROM reels WHERE orig_reel = ?",
         (orig_reel,),
     ).fetchone()
     if row is None:
+        if not create:
+            return None
         conn.execute(
-            "INSERT INTO reels (orig_reel, next_frame) VALUES (?, 0)", (orig_reel,)
+            "INSERT OR IGNORE INTO reels (orig_reel, next_frame) VALUES (?, 0)",
+            (orig_reel,),
         )
         row = conn.execute(
             "SELECT id, orig_reel, next_frame FROM reels WHERE orig_reel = ?",
@@ -156,16 +180,13 @@ def _load_reel(conn: sqlite3.Connection, orig_reel: str) -> _ReelState:
     )
 
 
-def _plan_interval(state: _ReelState, start: int, end: int):
-    """Split ``[start, end)`` into ordered, contiguous archive pieces.
+def _coverage_events(state: _ReelState, start: int, end: int):
+    """Walk ``[start, end)`` and describe existing coverage and gaps.
 
-    Returns ``(pieces, new_segments)``.  ``pieces`` is an ordered list of
-    ``(orig_start, frame_count, arch_start, is_new)`` covering the whole
-    interval without gaps; ``new_segments`` lists the freshly allocated
-    ``(orig_start, frame_count, arch_start)`` ranges.  Existing coverage is
-    reused in place, uncovered gaps are appended to the reel tail.
+    Returns ordered ``("gap", s, e)`` and ``("cov", s, e, arch_start)``
+    events that together cover the interval without overlaps.
     """
-    events = []  # ("gap", s, e) | ("cov", s, e, arch_start)
+    events = []
     cursor = start
     idx = bisect.bisect_left(state.starts, start)
     if idx > 0:
@@ -195,6 +216,19 @@ def _plan_interval(state: _ReelState, start: int, end: int):
         idx += 1
     if cursor < end:
         events.append(("gap", cursor, end))
+    return events
+
+
+def _plan_interval(state: _ReelState, start: int, end: int):
+    """Split ``[start, end)`` into ordered, contiguous archive pieces.
+
+    Returns ``(pieces, new_segments)``.  ``pieces`` is an ordered list of
+    ``(orig_start, frame_count, arch_start, is_new)`` covering the whole
+    interval without gaps; ``new_segments`` lists the freshly allocated
+    ``(orig_start, frame_count, arch_start)`` ranges.  Existing coverage is
+    reused in place, uncovered gaps are appended to the reel tail.
+    """
+    events = _coverage_events(state, start, end)
 
     pieces = []
     new_segments = []
@@ -275,134 +309,428 @@ def _coverage_pieces(state, intervals, new_set):
     return merged
 
 
+@dataclass
+class _RowPlan:
+    """Planned archive pieces for one CSV row (kept in CSV row order)."""
+
+    row: EditRow
+    pieces: list  # [(orig_start, frame_count, arch_start, is_new)]
+
+
+@dataclass
+class _ReelPlan:
+    """Planning result for one original reel, valid against a snapshot."""
+
+    orig_reel: str
+    snapshot_tail: int
+    snapshot_segments: tuple
+    state: _ReelState | None = None
+    rows: list = field(default_factory=list)
+    referenced: list = field(default_factory=list)
+
+
+def _empty_reel_state(orig_reel: str) -> _ReelState:
+    return _ReelState(None, orig_reel, 0, [])
+
+
+def _snapshot_reels(conn: sqlite3.Connection, orig_reels) -> dict[str, _ReelState]:
+    """Read the reels touched by an order without taking the write lock."""
+    snapshot = {}
+    for orig_reel in orig_reels:
+        snapshot[orig_reel] = (
+            _load_reel(conn, orig_reel, create=False)
+            or _empty_reel_state(orig_reel)
+        )
+    return snapshot
+
+
+def _load_reel_delta(
+    conn: sqlite3.Connection, plan: _ReelPlan, after_id: int
+) -> _ReelState:
+    """Read only what one reel gained since the plan's snapshot.
+
+    An ``archive_segments`` row is never rewritten, so rows at or below the
+    snapshot's highest id are immutable.  The commit-time re-check therefore
+    reads only newer rows -- an index range scan on the primary key -- which
+    keeps the write lock short even when a reel already has a huge coverage
+    index.
+    """
+    row = conn.execute(
+        "SELECT id, next_frame FROM reels WHERE orig_reel = ?",
+        (plan.orig_reel,),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO reels (orig_reel, next_frame) VALUES (?, 0)",
+            (plan.orig_reel,),
+        )
+        row = conn.execute(
+            "SELECT id, next_frame FROM reels WHERE orig_reel = ?",
+            (plan.orig_reel,),
+        ).fetchone()
+    fresh = conn.execute(
+        "SELECT orig_start, frame_count, arch_start "
+        "FROM archive_segments WHERE reel_id = ? AND id > ? "
+        "ORDER BY orig_start",
+        (row["id"], after_id),
+    ).fetchall()
+    return _ReelState(
+        row["id"],
+        plan.orig_reel,
+        row["next_frame"],
+        [(s["orig_start"], s["frame_count"], s["arch_start"]) for s in fresh],
+    )
+
+
+def _merged_state(plan: _ReelPlan, delta: _ReelState) -> _ReelState:
+    """Full current reel state: immutable snapshot plus its read delta."""
+    tail = max(delta.tail, plan.snapshot_tail)
+    return _ReelState(
+        delta.reel_id,
+        plan.orig_reel,
+        tail,
+        list(plan.snapshot_segments) + list(delta.segments),
+    )
+
+
+def _delta_touches(delta: _ReelState, intervals) -> bool:
+    """True when frames appended since the snapshot overlap ``intervals``.
+
+    Runs inside the short write transaction, so it binary-searches the
+    reference intervals instead of comparing every pair.
+    """
+    referenced = _merge_intervals(intervals)
+    if not referenced or not delta.segments:
+        return False
+    starts = [start for start, _end in referenced]
+    for seg_start, seg_count, _arch in delta.segments:
+        seg_end = seg_start + seg_count
+        # First referenced interval that could reach past seg_start.
+        idx = bisect.bisect_right(starts, seg_start) - 1
+        if idx >= 0 and referenced[idx][1] > seg_start:
+            return True
+        # Any referenced interval starting inside [seg_start, seg_end).
+        nxt = idx + 1
+        if nxt < len(referenced) and referenced[nxt][0] < seg_end:
+            return True
+    return False
+
+
+def _plan_rows(rows, snapshot: dict[str, _ReelState]) -> list[_ReelPlan]:
+    """Compute the whole order against a snapshot.  Pure in-memory work.
+
+    Rows are walked in CSV order, so uncovered frames are allocated to each
+    reel tail in the order they appear in the edit list.
+    """
+    plans: dict[str, _ReelPlan] = {}
+    for row in rows:
+        plan = plans.get(row.orig_reel)
+        if plan is None:
+            snap = snapshot[row.orig_reel]
+            plan = _ReelPlan(
+                row.orig_reel,
+                snap.tail,
+                tuple(snap.segments),
+                _ReelState(
+                    snap.reel_id, snap.orig_reel, snap.tail, list(snap.segments)
+                ),
+            )
+            plans[row.orig_reel] = plan
+        pieces, _new = _plan_interval(plan.state, row.orig_start, row.orig_end)
+        plan.rows.append(_RowPlan(row, pieces))
+        plan.referenced.append((row.orig_start, row.orig_end))
+    return list(plans.values())
+
+
+def _planned_new_segments(plan: _ReelPlan):
+    """Freshly allocated ``(orig_start, count, arch_start)`` of one reel."""
+    return [
+        (start, count, arch)
+        for row_plan in plan.rows
+        for start, count, arch, is_new in row_plan.pieces
+        if is_new
+    ]
+
+
+def _shift_allocations(plan: _ReelPlan, fresh: _ReelState) -> None:
+    """Move this order's own allocations to a newer reel tail.
+
+    Called when other orders appended frames this order does not use.  Every
+    piece at or above the snapshot tail was allocated by this order (existing
+    coverage always lies below the snapshot tail), so shifting by the tail
+    delta keeps the pieces contiguous and in CSV row order.
+    """
+    delta = fresh.tail - plan.snapshot_tail
+    plan.state.reel_id = fresh.reel_id
+    if delta:
+        for row_plan in plan.rows:
+            pieces = []
+            for start, count, arch, is_new in row_plan.pieces:
+                if arch >= plan.snapshot_tail:
+                    arch += delta
+                pieces.append((start, count, arch, is_new))
+            row_plan.pieces = pieces
+    new_segments = _planned_new_segments(plan)
+    plan.state.tail = fresh.tail + sum(count for _s, count, _a in new_segments)
+    plan.state.segments = sorted(list(fresh.segments) + new_segments)
+    plan.state.starts = [s[0] for s in plan.state.segments]
+
+
+def _replan(plan: _ReelPlan, fresh: _ReelState) -> None:
+    """Re-plan one reel against the actual current coverage.
+
+    Another order archived frames of this order in the meantime.  Frames that
+    are now covered keep their real landing points; still-missing frames are
+    appended to the current tail in CSV row order.
+    """
+    plan.state = _ReelState(
+        fresh.reel_id, plan.orig_reel, fresh.tail, list(fresh.segments)
+    )
+    for row_plan in plan.rows:
+        pieces, _new = _plan_interval(
+            plan.state, row_plan.row.orig_start, row_plan.row.orig_end
+        )
+        row_plan.pieces = pieces
+
+
+def _render_plan_rows(plans):
+    """Turn in-memory plans into binding parameters for each table.
+
+    Depends only on plan state, so it runs outside the write transaction.  The
+    manifest keeps one row per distinct covered range per reel, coalescing
+    overlapping CSV rows.
+    """
+    shots = []
+    shot_segments = []
+    copies = []
+    archives = []
+    for plan in plans:
+        for row_plan in plan.rows:
+            row = row_plan.row
+            shots.append(
+                (
+                    row.row_index,
+                    row.shot_no,
+                    row.orig_reel,
+                    row.orig_start,
+                    row.frame_count,
+                )
+            )
+            for seg_index, (start, count, arch, _is_new) in enumerate(
+                row_plan.pieces
+            ):
+                shot_segments.append(
+                    (
+                        row.row_index,
+                        row.shot_no,
+                        row.orig_reel,
+                        seg_index,
+                        start,
+                        count,
+                        arch,
+                    )
+                )
+        new_segments = _planned_new_segments(plan)
+        archives.extend(
+            (plan.orig_reel, start, count, arch)
+            for start, count, arch in new_segments
+        )
+        for start, count, arch, is_new in _coverage_pieces(
+            plan.state, plan.referenced, set(new_segments)
+        ):
+            copies.append(
+                (plan.orig_reel, start, count, arch, 1 if is_new else 0)
+            )
+    return shots, shot_segments, copies, archives
+
+
+def _insert_many(conn, sql, params) -> None:
+    if params:
+        conn.executemany(sql, params)
+
+
+class _SnapshotStale(Exception):
+    """The reels changed since the plan was made; re-plan outside the lock."""
+
+
+def _write_order(conn, order_no, film_no, row_count, shots, shot_segments,
+                 copies, archives, plans, reel_ids) -> None:
+    """Insert an already-rendered order.  Runs inside ``BEGIN IMMEDIATE``."""
+    cur = conn.execute(
+        "INSERT INTO orders (order_no, film_no, created_at, row_count) "
+        "VALUES (?, ?, ?, ?)",
+        (order_no, film_no, _now(), row_count),
+    )
+    order_id = cur.lastrowid
+
+    # Raise every reel tail before inserting archive segments so the tail
+    # safety trigger accepts all new ranges.
+    for plan in plans:
+        if _planned_new_segments(plan):
+            conn.execute(
+                "UPDATE reels SET next_frame = ? WHERE id = ?",
+                (plan.state.tail, reel_ids[plan.orig_reel]),
+            )
+    _insert_many(
+        conn,
+        "INSERT INTO archive_segments "
+        "(reel_id, orig_start, frame_count, arch_start, created_order_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(reel_ids[orig_reel], start, count, arch, order_id)
+         for orig_reel, start, count, arch in archives],
+    )
+    _insert_many(
+        conn,
+        "INSERT INTO shots "
+        "(order_id, row_index, shot_no, orig_reel, orig_start, frame_count) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [(order_id, *params) for params in shots],
+    )
+    _insert_many(
+        conn,
+        "INSERT INTO shot_segments "
+        "(order_id, row_index, shot_no, orig_reel, seg_index, orig_start, "
+        " frame_count, arch_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(order_id, *params) for params in shot_segments],
+    )
+    _insert_many(
+        conn,
+        "INSERT INTO order_copies "
+        "(order_id, orig_reel, orig_start, frame_count, arch_start, is_new) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [(order_id, *params) for params in copies],
+    )
+
+
 def submit_order(
     db_path: str | Path,
     order_no: str,
     film_no: str,
     rows,
 ) -> dict:
-    """Plan and store one hand-in order atomically, then return its report."""
+    """Plan and store one hand-in order atomically, then return its report.
+
+    Planning, manifest assembly and the per-shot retrieval split all run
+    against a read snapshot outside any write transaction.  The completed
+    order is committed in one short ``BEGIN IMMEDIATE`` transaction that only
+    validates the referenced coverage and inserts rows, so other submissions
+    keep completing -- including appends to the same reels -- while a large
+    CSV is being computed.
+
+    Concurrent changes are reconciled at commit time: if frames this order
+    needs were archived by another order, their real landing points are
+    adopted; frames still missing are appended to the latest tail in CSV row
+    order.  If only unrelated frames were appended, the planned segments stay
+    in place and freshly copied pieces shift to the new tail.  Any failure
+    rolls the whole order back; committed orders and their reel tails remain.
+    """
     order_no = clean_identifier(order_no, "单号")
     film_no = clean_identifier(film_no, "成片号")
     rows = validate_rows(rows)
 
+    orig_reels = []
+    seen_reels = set()
+    for row in rows:
+        if row.orig_reel not in seen_reels:
+            seen_reels.add(row.orig_reel)
+            orig_reels.append(row.orig_reel)
+
     conn = connect(db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            exists = conn.execute(
-                "SELECT 1 FROM orders WHERE order_no = ?", (order_no,)
-            ).fetchone()
-            if exists:
-                raise DuplicateOrderError(f"单号 {order_no} 已存在，请勿重复交档")
-            cur = conn.execute(
-                "INSERT INTO orders (order_no, film_no, created_at, row_count) "
-                "VALUES (?, ?, ?, ?)",
-                (order_no, film_no, _now(), len(rows)),
-            )
-            order_id = cur.lastrowid
-
-            reels: dict[str, _ReelState] = {}
-            referenced: dict[str, list[tuple[int, int]]] = {}
-            created: dict[str, list[tuple[int, int, int]]] = {}
-            for row in rows:
-                state = reels.get(row.orig_reel)
-                if state is None:
-                    state = _load_reel(conn, row.orig_reel)
-                    reels[row.orig_reel] = state
-
-                pieces, new_segments = _plan_interval(
-                    state, row.orig_start, row.orig_end
-                )
-
-                # Raise the reel tail first so the safety triggers, which
-                # compare against reels.next_frame, accept the new segments.
-                if new_segments:
-                    conn.execute(
-                        "UPDATE reels SET next_frame = ? WHERE id = ?",
-                        (state.tail, state.reel_id),
+        for attempt in range(APPLY_ATTEMPTS):
+            # Phase 1: duplicate check and a consistent read snapshot.  In WAL
+            # mode this read transaction does not block other writers.
+            conn.execute("BEGIN")
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM orders WHERE order_no = ?", (order_no,)
+                ).fetchone()
+                if exists:
+                    raise DuplicateOrderError(
+                        f"单号 {order_no} 已存在，请勿重复交档"
                     )
-                    for seg_start, seg_count, seg_arch in new_segments:
-                        conn.execute(
-                            "INSERT INTO archive_segments "
-                            "(reel_id, orig_start, frame_count, arch_start, "
-                            " created_order_id) VALUES (?, ?, ?, ?, ?)",
-                            (
-                                state.reel_id,
-                                seg_start,
-                                seg_count,
-                                seg_arch,
-                                order_id,
-                            ),
+                snapshot = _snapshot_reels(conn, orig_reels)
+                segment_watermark = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM archive_segments"
+                ).fetchone()[0]
+            finally:
+                conn.execute("COMMIT")
+
+            # Phase 2: plan the whole order in memory, holding no lock.
+            plans = _plan_rows(rows, snapshot)
+            prepared = _render_plan_rows(plans)
+
+            # Phase 3: short write transaction -- re-check the reels, adjust
+            # the prepared plan if needed, and insert everything.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM orders WHERE order_no = ?", (order_no,)
+                ).fetchone()
+                if exists:
+                    raise DuplicateOrderError(
+                        f"单号 {order_no} 已存在，请勿重复交档"
+                    )
+
+                deltas = {}
+                reel_ids = {}
+                stale = set()
+                for plan in plans:
+                    delta = _load_reel_delta(conn, plan, segment_watermark)
+                    deltas[plan.orig_reel] = delta
+                    reel_ids[plan.orig_reel] = delta.reel_id
+                    if _delta_touches(delta, plan.referenced):
+                        stale.add(plan.orig_reel)
+                if stale and attempt < APPLY_ATTEMPTS - 1:
+                    # Some frames this order needs were archived meanwhile.
+                    # Re-plan outside the lock rather than while holding it.
+                    raise _SnapshotStale
+
+                # Adjust the prepared plan cheaply: adopt actual landing
+                # points for concurrently archived frames, and move only this
+                # order's own copies to the current tail.  On the final
+                # attempt this also covers the stale case.
+                changed = False
+                for plan in plans:
+                    delta = deltas[plan.orig_reel]
+                    if plan.orig_reel in stale:
+                        _replan(plan, _merged_state(plan, delta))
+                        changed = True
+                    elif delta.tail != plan.snapshot_tail:
+                        _shift_allocations(
+                            plan, _merged_state(plan, delta)
                         )
+                        changed = True
+                    else:
+                        plan.state.reel_id = delta.reel_id
 
-                referenced.setdefault(row.orig_reel, []).append(
-                    (row.orig_start, row.orig_end)
+                if changed:
+                    prepared = _render_plan_rows(plans)
+                shots, shot_segments, copies, archives = prepared
+                _write_order(
+                    conn,
+                    order_no,
+                    film_no,
+                    len(rows),
+                    shots,
+                    shot_segments,
+                    copies,
+                    archives,
+                    plans,
+                    reel_ids,
                 )
-                created.setdefault(row.orig_reel, []).extend(new_segments)
-
-                conn.execute(
-                    "INSERT INTO shots "
-                    "(order_id, row_index, shot_no, orig_reel, orig_start, "
-                    " frame_count) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        order_id,
-                        row.row_index,
-                        row.shot_no,
-                        row.orig_reel,
-                        row.orig_start,
-                        row.frame_count,
-                    ),
-                )
-
-                for seg_index, (piece_start, piece_count, piece_arch, _) in enumerate(
-                    pieces
-                ):
-                    conn.execute(
-                        "INSERT INTO shot_segments "
-                        "(order_id, row_index, shot_no, orig_reel, seg_index, "
-                        " orig_start, frame_count, arch_start) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            order_id,
-                            row.row_index,
-                            row.shot_no,
-                            row.orig_reel,
-                            seg_index,
-                            piece_start,
-                            piece_count,
-                            piece_arch,
-                        ),
-                    )
-
-            # One manifest row per distinct covered range this order touches.
-            for orig_reel, intervals in referenced.items():
-                state = reels[orig_reel]
-                new_set = set(created.get(orig_reel, ()))
-                for start, count, arch, is_new in _coverage_pieces(
-                    state, intervals, new_set
-                ):
-                    conn.execute(
-                        "INSERT INTO order_copies "
-                        "(order_id, orig_reel, orig_start, frame_count, "
-                        " arch_start, is_new) VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            order_id,
-                            orig_reel,
-                            start,
-                            count,
-                            arch,
-                            1 if is_new else 0,
-                        ),
-                    )
-
-            conn.execute("COMMIT")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+                conn.execute("COMMIT")
+                break
+            except _SnapshotStale:
+                # Another order committed frames this order needs.  Back off
+                # outside the lock, then take a fresh snapshot and re-plan.
+                conn.execute("ROLLBACK")
+                time.sleep(0.02 * (2**attempt))
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
     finally:
         conn.close()
-
     report = get_order(db_path, order_no)
     if report is None:  # pragma: no cover - committed rows must be visible
         raise RuntimeError("order vanished after commit")
