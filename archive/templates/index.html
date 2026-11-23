@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h1>交档</h1>
+  <p class="hint">填写成片号，上传剪辑 CSV。每行一个镜头：<code>镜头号,原卷号,起帧,帧数</code>。
+  起帧为该镜头在原卷中的起始帧（从 0 计），帧数为该镜头长度。</p>
+
+  {% if errors %}
+  <div class="errors" role="alert">
+    <strong>交档未通过，档案卷未发生任何改动：</strong>
+    <ul>
+      {% for message in errors %}<li>{{ message }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('submit') }}" enctype="multipart/form-data" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>
+      <span>单号</span>
+      <input name="order_no" value="{{ form.order_no }}" required maxlength="200"
+             placeholder="例如 ORD-2026-0001" autocomplete="off">
+    </label>
+    <label>
+      <span>成片号</span>
+      <input name="film_no" value="{{ form.film_no }}" required maxlength="200"
+             placeholder="例如 FILM-A" autocomplete="off">
+    </label>
+    <label>
+      <span>剪辑 CSV</span>
+      <input type="file" name="csv_file" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">提交交档</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>按单号查询</h2>
+  <form method="get" action="{{ url_for('index') }}" class="inline" onsubmit="
+      event.preventDefault();
+      var v = this.querySelector('input').value.trim();
+      if (v) window.location.href = '/orders/' + encodeURIComponent(v);">
+    <input name="order_no" placeholder="输入单号" maxlength="200">
+    <button type="submit">查询</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>最近交档</h2>
+  {% if orders %}
+  <table>
+    <thead><tr><th>单号</th><th>成片号</th><th>镜头行数</th><th>交档时间 (UTC)</th></tr></thead>
+    <tbody>
+      {% for order in orders %}
+      <tr>
+        <td><a href="{{ url_for('order_detail', order_no=order.order_no) }}">{{ order.order_no }}</a></td>
+        <td>{{ order.film_no }}</td>
+        <td class="num">{{ order.row_count }}</td>
+        <td class="mono">{{ order.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">暂无交档记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

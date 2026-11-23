@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}请求有误 · 胶片档案交档{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>请求有误</h1>
+  <p>{{ message }}</p>
+  <p><a href="{{ url_for('index') }}">返回交档页</a></p>
+</section>
+{% endblock %}

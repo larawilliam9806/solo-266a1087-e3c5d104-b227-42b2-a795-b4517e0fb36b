@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}未找到 · 胶片档案交档{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>未找到</h1>
+  <p>没有找到 <code>{{ order_no }}</code> 对应的记录。</p>
+  <p><a href="{{ url_for('index') }}">返回交档页</a></p>
+</section>
+{% endblock %}

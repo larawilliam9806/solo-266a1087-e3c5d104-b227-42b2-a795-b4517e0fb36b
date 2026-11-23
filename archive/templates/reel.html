@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}原卷 {{ reel.orig_reel }} · 胶片档案交档{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="title-row">
+    <div>
+      <h1>原卷 {{ reel.orig_reel }} 的档案卷</h1>
+      <p class="hint">档案帧号从 0 起。当前卷尾（下一个可用帧号）：<strong>{{ reel.next_frame }}</strong></p>
+    </div>
+    <a class="button-link" href="{{ url_for('api_reel', orig_reel=reel.orig_reel) }}">JSON</a>
+  </div>
+</section>
+
+<section class="card">
+  <h2>覆盖索引</h2>
+  <p class="hint">连续的原卷帧段在档案卷中的落点。新帧总是接在卷尾追加。</p>
+  <table>
+    <thead>
+      <tr><th>原卷帧段</th><th>帧数</th><th>档案帧段</th><th>首拷单号</th></tr>
+    </thead>
+    <tbody>
+      {% for seg in reel.segments %}
+      <tr>
+        <td class="mono">[{{ seg.orig_start }}, {{ seg.orig_end }})</td>
+        <td class="num">{{ seg.frame_count }}</td>
+        <td class="mono">[{{ seg.arch_start }}, {{ seg.arch_end }})</td>
+        <td>
+          {% if seg.created_order_no %}
+          <a href="{{ url_for('order_detail', order_no=seg.created_order_no) }}">{{ seg.created_order_no }}</a>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="hint">该原卷尚未收档。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

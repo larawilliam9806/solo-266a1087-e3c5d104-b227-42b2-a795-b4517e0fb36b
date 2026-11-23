@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}单号 {{ order.order_no }} · 胶片档案交档{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="title-row">
+    <div>
+      <h1>单号 {{ order.order_no }}</h1>
+      <p class="hint">成片号 {{ order.film_no }} · {{ order.row_count }} 个镜头行 · 交档时间 {{ order.created_at }} (UTC)</p>
+    </div>
+    <a class="button-link" href="{{ url_for('api_order', order_no=order.order_no) }}">JSON</a>
+  </div>
+</section>
+
+<section class="card">
+  <h2>本次拷贝：原卷帧段 → 档案落点</h2>
+  <p class="hint">帧段为半开区间 <code>[起, 止)</code>。标记“新拷”的段落由本单写入档案卷尾；
+  “沿用”表示档案中已有同一批帧，未重复拷贝。</p>
+  {% if order.copies %}
+  <table>
+    <thead>
+      <tr>
+        <th>原卷号</th><th>原卷帧段</th><th>帧数</th>
+        <th>档案帧段</th><th>来源</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for copy in order.copies %}
+      <tr>
+        <td><a href="{{ url_for('reel_detail', orig_reel=copy.orig_reel) }}">{{ copy.orig_reel }}</a></td>
+        <td class="mono">[{{ copy.orig_start }}, {{ copy.orig_end }})</td>
+        <td class="num">{{ copy.frame_count }}</td>
+        <td class="mono">[{{ copy.arch_start }}, {{ copy.arch_end }})</td>
+        <td>{% if copy.is_new %}<span class="tag new">新拷</span>{% else %}<span class="tag reuse">沿用</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">本单没有可拷贝的帧段。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>取帧单：每个镜头的档案读取顺序</h2>
+  <p class="hint">按 seg 顺序读取各档案帧段并依次拼接，即可还原该镜头的原始帧序。</p>
+  {% for shot in order.shots %}
+  <details class="shot" open>
+    <summary>
+      行 {{ shot.row_index }} · 镜头号 <strong>{{ shot.shot_no }}</strong>
+      · 原卷 <a href="{{ url_for('reel_detail', orig_reel=shot.orig_reel) }}">{{ shot.orig_reel }}</a>
+      <span class="mono">[{{ shot.orig_start }}, {{ shot.orig_end }})</span>
+      · {{ shot.frame_count }} 帧
+    </summary>
+    <table>
+      <thead>
+        <tr><th>顺序</th><th>档案帧段</th><th>帧数</th><th>对应原卷帧段</th></tr>
+      </thead>
+      <tbody>
+        {% for seg in shot.segments %}
+        <tr>
+          <td class="num">{{ seg.seg_index + 1 }}</td>
+          <td class="mono">[{{ seg.arch_start }}, {{ seg.arch_end }})</td>
+          <td class="num">{{ seg.frame_count }}</td>
+          <td class="mono">[{{ seg.orig_start }}, {{ seg.orig_end }})</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endfor %}
+</section>
+
+{% if order.touched_reels %}
+<section class="card">
+  <h2>涉及档案卷的卷尾</h2>
+  <p class="hint">“卷尾”为该档案卷当前下一个可用帧号，包含此前交档已占用的帧。</p>
+  <table>
+    <thead><tr><th>原卷号</th><th>档案卷尾（下一个可用帧号）</th></tr></thead>
+    <tbody>
+      {% for reel in order.touched_reels %}
+      <tr>
+        <td><a href="{{ url_for('reel_detail', orig_reel=reel.orig_reel) }}">{{ reel.orig_reel }}</a></td>
+        <td class="num">{{ reel.next_frame }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endblock %}
